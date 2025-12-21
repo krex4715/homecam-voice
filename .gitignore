@@ -25,4 +25,5 @@ dist-ssr
 
 /public/mediapipe/**
 
-./release/**
+# /release folder
+/release/**

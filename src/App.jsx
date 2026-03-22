@@ -1,5 +1,6 @@
 // src/App.jsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
 
 /**
  * ⚠️ 보안 주의:
@@ -36,6 +37,51 @@ const DEVICE_ID = import.meta.env.VITE_DEVICE_ID || "homecam-001";
 
 // 웹 상태 하트비트(옵션)
 const WEB_HEARTBEAT_MS = 30_000;
+
+const ASSISTANT_VOICE_HOLD_MS = 450;
+const POSE_DETECT_INTERVAL_MS = 1000 / 12;
+const POSE_WASM_BASE_URL =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm";
+const POSE_MODEL_ASSET_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+const POSE_CONNECTIONS = [
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 7],
+  [0, 4],
+  [4, 5],
+  [5, 6],
+  [6, 8],
+  [9, 10],
+  [11, 12],
+  [11, 13],
+  [13, 15],
+  [15, 17],
+  [15, 19],
+  [15, 21],
+  [17, 19],
+  [12, 14],
+  [14, 16],
+  [16, 18],
+  [16, 20],
+  [16, 22],
+  [18, 20],
+  [11, 23],
+  [12, 24],
+  [23, 24],
+  [23, 25],
+  [24, 26],
+  [25, 27],
+  [26, 28],
+  [27, 29],
+  [28, 30],
+  [29, 31],
+  [30, 32],
+  [27, 31],
+  [28, 32],
+];
 
 // ---------------- Base64 helpers (audio) ----------------
 function arrayBufferToBase64(buffer) {
@@ -113,6 +159,12 @@ function safeJsonParse(s) {
   }
 }
 
+function getLandmarkVisibility(landmark) {
+  const visibility = landmark?.visibility;
+  if (typeof visibility !== "number") return 1;
+  return visibility;
+}
+
 export default function App() {
   const [status, setStatus] = useState("초기화 중...");
   const [connected, setConnected] = useState(false);
@@ -140,6 +192,11 @@ export default function App() {
 
   // Snapshot offscreen canvas
   const snapCanvasRef = useRef(null);
+  const poseCanvasRef = useRef(null);
+  const poseLandmarkerRef = useRef(null);
+  const poseLoopRafRef = useRef(null);
+  const poseBusyRef = useRef(false);
+  const lastPoseDetectTsRef = useRef(0);
 
   // WS
   const wsRef = useRef(null);
@@ -155,6 +212,10 @@ export default function App() {
   const outGainRef = useRef(null);
   const nextPlayTimeRef = useRef(0);
   const playingSourcesRef = useRef([]);
+
+  // assistant speech guard (block mic append during TTS playback)
+  const assistantSpeakingRef = useRef(false);
+  const assistantSpeakingReleaseTimerRef = useRef(null);
 
   // response state
   const activeResponseIdRef = useRef(null);
@@ -217,6 +278,121 @@ export default function App() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify(obj));
   }, []);
+
+  const setAssistantSpeaking = useCallback(
+    (isSpeaking) => {
+      if (assistantSpeakingReleaseTimerRef.current) {
+        clearTimeout(assistantSpeakingReleaseTimerRef.current);
+        assistantSpeakingReleaseTimerRef.current = null;
+      }
+
+      if (isSpeaking) {
+        if (!assistantSpeakingRef.current) {
+          pushLog("🤖 모델 음성 재생 중: 마이크 업로드 임시 차단");
+        }
+        assistantSpeakingRef.current = true;
+        return;
+      }
+
+      assistantSpeakingReleaseTimerRef.current = setTimeout(() => {
+        assistantSpeakingReleaseTimerRef.current = null;
+        if (assistantSpeakingRef.current) {
+          assistantSpeakingRef.current = false;
+          pushLog("🎤 마이크 업로드 차단 해제");
+        }
+      }, ASSISTANT_VOICE_HOLD_MS);
+    },
+    [pushLog]
+  );
+
+  const drawPoseOverlay = useCallback((landmarks) => {
+    const canvas = poseCanvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const drawWidth = Math.max(1, Math.round(rect.width * dpr));
+    const drawHeight = Math.max(1, Math.round(rect.height * dpr));
+
+    if (canvas.width !== drawWidth || canvas.height !== drawHeight) {
+      canvas.width = drawWidth;
+      canvas.height = drawHeight;
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, drawWidth, drawHeight);
+
+    if (!landmarks || landmarks.length === 0) return;
+
+    const isFall = alertActiveRef.current || lastFallStateRef.current === "fall";
+    const stroke = isFall ? "#ef4444" : "#f8fafc";
+    const pointFill = isFall ? "#f87171" : "#ffffff";
+
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.2 * dpr;
+
+    for (const [a, b] of POSE_CONNECTIONS) {
+      const p1 = landmarks[a];
+      const p2 = landmarks[b];
+      if (!p1 || !p2) continue;
+      if (getLandmarkVisibility(p1) < 0.35 || getLandmarkVisibility(p2) < 0.35) {
+        continue;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(p1.x * drawWidth, p1.y * drawHeight);
+      ctx.lineTo(p2.x * drawWidth, p2.y * drawHeight);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = pointFill;
+    for (const lm of landmarks) {
+      if (!lm || getLandmarkVisibility(lm) < 0.35) continue;
+      ctx.beginPath();
+      ctx.arc(lm.x * drawWidth, lm.y * drawHeight, 2.6 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }, []);
+
+  const startPoseLoop = useCallback(() => {
+    if (poseLoopRafRef.current) return;
+
+    const tick = () => {
+      poseLoopRafRef.current = requestAnimationFrame(tick);
+
+      const video = videoRef.current;
+      const poseLandmarker = poseLandmarkerRef.current;
+      if (!video || !poseLandmarker || video.readyState < 2) {
+        drawPoseOverlay(null);
+        return;
+      }
+
+      const now = performance.now();
+      if (now - lastPoseDetectTsRef.current < POSE_DETECT_INTERVAL_MS) return;
+      if (poseBusyRef.current) return;
+
+      lastPoseDetectTsRef.current = now;
+      poseBusyRef.current = true;
+      try {
+        const result = poseLandmarker.detectForVideo(video, now);
+        const landmarks = result?.landmarks?.[0] || null;
+        drawPoseOverlay(landmarks);
+      } catch {
+        drawPoseOverlay(null);
+      } finally {
+        poseBusyRef.current = false;
+      }
+    };
+
+    poseLoopRafRef.current = requestAnimationFrame(tick);
+  }, [drawPoseOverlay]);
 
   // ---------------- Web notify (webhook) ----------------
   const postWebStatus = useCallback(
@@ -335,16 +511,19 @@ export default function App() {
       if (audioOutCtxRef.current) {
         nextPlayTimeRef.current = audioOutCtxRef.current.currentTime;
       }
+      setAssistantSpeaking(false);
     }
-  }, []);
+  }, [setAssistantSpeaking]);
 
   const enqueueModelAudioChunk = useCallback(
     async (base64Audio) => {
       if (!playModelAudio) return;
+      setAssistantSpeaking(true);
 
       try {
         await ensureAudioOut();
       } catch {
+        setAssistantSpeaking(false);
         return;
       }
 
@@ -370,9 +549,12 @@ export default function App() {
         playingSourcesRef.current = playingSourcesRef.current.filter(
           (s) => s !== src
         );
+        if (playingSourcesRef.current.length === 0) {
+          setAssistantSpeaking(false);
+        }
       };
     },
-    [ensureAudioOut, playModelAudio]
+    [ensureAudioOut, playModelAudio, setAssistantSpeaking]
   );
 
   // ---------------- Mic capture (항상 ON) ----------------
@@ -452,6 +634,8 @@ export default function App() {
           lastMeterTsRef.current = now;
           setMicLevel(Math.min(1, rmsLevel(input) * 6));
         }
+
+        if (assistantSpeakingRef.current) return;
 
         if (!micSendOnRef.current) return;
         const ws = wsRef.current;
@@ -884,6 +1068,11 @@ export default function App() {
 
         // ----- VAD events -----
         case "input_audio_buffer.speech_started": {
+          if (assistantSpeakingRef.current) {
+            pushLog("🔇 모델 발화 중 speech_started 무시");
+            break;
+          }
+
           userSpeakingRef.current = true;
           hadSpeechSinceLastCommitRef.current = true;
 
@@ -898,6 +1087,10 @@ export default function App() {
         }
 
         case "input_audio_buffer.speech_stopped": {
+          if (assistantSpeakingRef.current) {
+            break;
+          }
+
           userSpeakingRef.current = false;
           pushLog("🎙️ speech_stopped");
 
@@ -1084,6 +1277,52 @@ export default function App() {
     }, 100);
     return () => clearTimeout(t);
   }, [connectRealtime]);
+
+  // ---------------- Pose skeleton (MediaPipe) ----------------
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initPoseLandmarker() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(POSE_WASM_BASE_URL);
+        if (cancelled) return;
+
+        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: POSE_MODEL_ASSET_URL,
+          },
+          runningMode: "VIDEO",
+          numPoses: 1,
+        });
+        if (cancelled) return;
+
+        pushLog("🦴 Pose skeleton 초기화 완료");
+        startPoseLoop();
+      } catch (e) {
+        pushLog(`🦴 Pose skeleton 초기화 실패: ${e?.message || e}`);
+      }
+    }
+
+    initPoseLandmarker();
+
+    return () => {
+      cancelled = true;
+      if (poseLoopRafRef.current) {
+        cancelAnimationFrame(poseLoopRafRef.current);
+        poseLoopRafRef.current = null;
+      }
+      if (assistantSpeakingReleaseTimerRef.current) {
+        clearTimeout(assistantSpeakingReleaseTimerRef.current);
+        assistantSpeakingReleaseTimerRef.current = null;
+      }
+      if (poseLandmarkerRef.current) {
+        try {
+          poseLandmarkerRef.current.close();
+        } catch {}
+        poseLandmarkerRef.current = null;
+      }
+    };
+  }, [pushLog, startPoseLoop]);
 
   // ---------------- AI fall monitor loop (1 fps) ----------------
   useEffect(() => {
@@ -1411,6 +1650,16 @@ export default function App() {
               width: "100%",
               height: "100%",
               objectFit: "cover",
+            }}
+          />
+          <canvas
+            ref={poseCanvasRef}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
             }}
           />
           <div

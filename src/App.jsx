@@ -212,6 +212,7 @@ export default function App() {
   const outGainRef = useRef(null);
   const nextPlayTimeRef = useRef(0);
   const playingSourcesRef = useRef([]);
+  const hasModelAudioOutputRef = useRef(false);
 
   // assistant speech guard (block mic append during TTS playback)
   const assistantSpeakingRef = useRef(false);
@@ -519,6 +520,7 @@ export default function App() {
     async (base64Audio) => {
       if (!playModelAudio) return;
       setAssistantSpeaking(true);
+      hasModelAudioOutputRef.current = true;
 
       try {
         await ensureAudioOut();
@@ -848,28 +850,41 @@ export default function App() {
   }, [replaceStream]);
 
   // ---------------- Session update ----------------
-  const sendSessionUpdate = useCallback(() => {
-    sendEvent({
-      type: "session.update",
-      session: {
-        type: "realtime",
-        model: REALTIME_MODEL,
-        output_modalities: ["audio"],
-        instructions:
-          "너는 노인 돌봄 홈캠 안에 들어있는, 친절하고 느긋한 한국어 비서야. " +
-          "항상 존댓말로 부드럽게 대답해줘. " +
-          "사용자가 말하면 짧고 명확하게 응답해줘.",
-        audio: {
-          input: {
-            format: { type: "audio/pcm", rate: TARGET_SR },
-            turn_detection: autoVoiceMode ? { type: "semantic_vad" } : null,
-          },
-          output: {
-            format: { type: "audio/pcm", rate: TARGET_SR },
-            voice: "marin",
-          },
+  const sendSessionUpdate = useCallback((options = {}) => {
+    const { includeImmutableFields = true } = options;
+
+    const session = {
+      type: "realtime",
+      output_modalities: ["audio"],
+      instructions:
+        "너는 노인 돌봄 홈캠 안에 들어있는, 친절하고 느긋한 한국어 비서야. " +
+        "항상 존댓말로 부드럽게 대답해줘. " +
+        "사용자가 말하면 짧고 명확하게 응답해줘.",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: TARGET_SR },
+        },
+        output: {
+          format: { type: "audio/pcm" },
         },
       },
+    };
+
+    if (includeImmutableFields) {
+      session.model = REALTIME_MODEL;
+    }
+
+    if (autoVoiceMode) {
+      session.audio.input.turn_detection = { type: "semantic_vad" };
+    }
+
+    if (includeImmutableFields && !hasModelAudioOutputRef.current) {
+      session.audio.output.voice = "marin";
+    }
+
+    sendEvent({
+      type: "session.update",
+      session,
     });
   }, [autoVoiceMode, sendEvent]);
 
@@ -1031,7 +1046,7 @@ export default function App() {
       switch (ev.type) {
         case "session.created": {
           pushLog("session.created 수신");
-          sendSessionUpdate();
+          sendSessionUpdate({ includeImmutableFields: true });
           pushLog("session.update 전송");
 
           // session.updated 오면 입력버퍼 clear 하려고 pending
@@ -1299,6 +1314,7 @@ export default function App() {
         pushLog("🦴 Pose skeleton 초기화 완료");
         startPoseLoop();
       } catch (e) {
+        console.error("Pose skeleton init failed:", e);
         pushLog(`🦴 Pose skeleton 초기화 실패: ${e?.message || e}`);
       }
     }
@@ -1370,7 +1386,7 @@ export default function App() {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
     sessionReadyRef.current = false;
-    sendSessionUpdate();
+    sendSessionUpdate({ includeImmutableFields: false });
     pushLog(`(설정 변경) session.update 전송: autoVoiceMode=${autoVoiceMode}`);
 
     if (autoVoiceMode && micSendOnRef.current) {

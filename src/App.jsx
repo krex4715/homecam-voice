@@ -865,7 +865,7 @@ export default function App() {
           format: { type: "audio/pcm", rate: TARGET_SR },
         },
         output: {
-          format: { type: "audio/pcm" },
+          format: { type: "audio/pcm", rate: TARGET_SR },
         },
       },
     };
